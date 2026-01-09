@@ -2,6 +2,8 @@
 
 **P&S Ultimate RSI MTF** es un indicador de lectura de momentum y contexto multi-timeframe basado en el motor “Ultimate RSI” y complementado con un módulo de divergencias que se dibuja únicamente sobre el gráfico de precio (overlay).
 
+<img width="1567" height="878" alt="image" src="https://github.com/user-attachments/assets/e84b0428-51f6-43f8-912e-c928db9fcc47" />
+
 > **Nota:** Este indicador no es una estrategia. No define entradas ni salidas. Solo organiza información de momentum, sesgo relativo y señales de divergencia para apoyar el análisis.
 
 ## Objetivo

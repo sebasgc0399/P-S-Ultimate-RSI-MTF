@@ -1,0 +1,406 @@
+//@version=6
+indicator("P&S Ultimate RSI MTF", shorttitle="P&S_URSI_D",
+     overlay=false, precision=0, max_labels_count=500, max_lines_count=500)
+
+//====================================================
+// 0) Helpers
+//====================================================
+f_ma(series float x, int len, string maType) =>
+    // Calcula TODO en cada barra (evita warning de consistency)
+    float _ema = ta.ema(x, len)
+    float _sma = ta.sma(x, len)
+    float _rma = ta.rma(x, len)
+    float _tma = ta.sma(ta.sma(x, len), len)
+    maType == "EMA" ? _ema :
+     maType == "SMA" ? _sma :
+     maType == "RMA" ? _rma : _tma
+
+// Ultimate RSI engine (LuxAlgo)
+f_ursi(series float _src, int _len, string _method) =>
+    float upper = ta.highest(_src, _len)
+    float lower = ta.lowest(_src, _len)
+    float r = upper - lower
+    float d = _src - _src[1]
+    float diff = upper > upper[1] ? r : lower < lower[1] ? -r : d
+    float num = f_ma(diff, _len, _method)
+    float den = f_ma(math.abs(diff), _len, _method)
+    float arsi = den == 0.0 ? 50.0 : (num / den * 50.0 + 50.0)
+    arsi
+
+// Divergencias helpers (Lux Candlestick RSI)
+keep_in_range(_val, _max, _min) => math.min(math.max(_val, _min), _max)
+
+// ✅ FIX: reemplazo del ternario multilinea por switch (estable en v6)
+linestyle(_input) =>
+    switch _input
+        "___"   => line.style_solid
+        "- - -" => line.style_dashed
+        ". . ." => line.style_dotted
+        => line.style_solid
+
+// UDT
+type pb
+    float price
+    int   bar
+
+//====================================================
+// 1) Inputs
+//====================================================
+groupVis  = "Visual"
+mode      = input.string("Limpio", "Modo visual", options=["Limpio","Debug"], group=groupVis)
+showBands = input.bool(false, "Sombrear Regímenes (OB/OS)", group=groupVis)
+showKC    = input.bool(true,  "Mostrar KISS/CROSS", group=groupVis)
+showSig   = input.bool(false, "Mostrar Signal line (Soldado)", group=groupVis)
+autoColor = input.bool(true,  "Color auto (medio)", group=groupVis)
+
+groupCore = "Ultimate RSI (Motor)"
+src      = input.source(hlc3, "Fuente", group=groupCore)  // ✅ default HLC3
+
+// Soldado
+lenSold  = input.int(14, "Soldado Length", minval=2, group=groupCore)
+metSold  = input.string("EMA", "Soldado Method", options=["EMA","SMA","RMA","TMA"], group=groupCore)  // ✅ default EMA
+
+// Signal (Soldado)
+groupSig = "Signal Line (Soldado)"
+sigLen   = input.int(14, "Signal Smooth", minval=1, group=groupSig)
+sigMet   = input.string("EMA", "Signal Method", options=["EMA","SMA","RMA","TMA"], group=groupSig)    // ✅ default EMA
+
+// Padrino 1 (principal)
+groupP1 = "Padrino 1 (MTF)"
+useP1   = input.bool(true, "Activar Padrino 1", group=groupP1)
+tfP1    = input.timeframe("60", "TF Padrino 1", group=groupP1)
+lenP1   = input.int(14, "Padrino 1 Length", minval=2, group=groupP1)
+metP1   = input.string("EMA", "Padrino 1 Method", options=["EMA","SMA","RMA","TMA"], group=groupP1)  // ✅ default EMA
+
+// Padrino 2 (opcional)
+groupP2 = "Padrino 2 (MTF opcional)"
+useP2   = input.bool(false, "Activar Padrino 2", group=groupP2) // ✅ default OFF
+tfP2    = input.timeframe("240", "TF Padrino 2", group=groupP2) // ✅ default 4H
+lenP2   = input.int(14, "Padrino 2 Length", minval=2, group=groupP2)
+metP2   = input.string("RMA", "Padrino 2 Method", options=["EMA","SMA","RMA","TMA"], group=groupP2) // ✅ default RMA
+stack   = input.string("Ignore", "Confluencia P1/P2", options=["Ignore","SoldadoAboveBoth","P1AboveP2"], group=groupP2)
+
+// Levels
+groupLv = "Niveles"
+obValue = input.float(80, "Sobrecompradas", minval=55, maxval=95, group=groupLv)
+osValue = input.float(20, "Sobrevendidas",  minval=5,  maxval=45, group=groupLv)
+midLine = input.float(50, "Mid",            minval=40, maxval=60, group=groupLv)
+
+// Sesgo / Filtros
+groupBias = "Sesgo & Filtros"
+biasMode  = input.string("Relativo", "Sesgo del Padrino", options=["Relativo","Pendiente"], group=groupBias)
+slopeLen  = input.int(5, "Pendiente: suavizado", minval=2, maxval=50, group=groupBias)
+flatThr   = input.float(0.20, "Padrino plano si |pendiente| < ", minval=0.0, step=0.05, group=groupBias)
+blockFlat = input.bool(false, "Bloquear señales si Padrino plano", group=groupBias) // ✅ default OFF
+
+useSignalFilter = input.bool(true, "Filtro: Soldado y Signal (timing extra)", group=groupBias)
+requireExtreme  = input.bool(true, "Exigir extremo (BUY en OS / SELL en OB)", group=groupBias)
+
+// KISS / CROSS
+groupKCx = "KISS / CROSS (Soldado vs Padrino 1)"
+touchThr = input.float(1.5, "KISS: umbral toque (pts RSI)", minval=0.1, step=0.1, group=groupKCx)
+rejBars  = input.int(10,    "KISS: ventana (barras)", minval=1, maxval=10, group=groupKCx) // ✅ default 10
+rejMove  = input.float(2.0, "KISS: separación mínima", minval=0.1, step=0.1, group=groupKCx)
+impulse  = input.float(8.5, "CROSS: impulso mínimo (ΔSoldado)", minval=0.5, step=0.5, group=groupKCx)
+
+// Cooldown
+groupCD = "Cooldown"
+cooldownBars = input.int(8, "Cooldown (barras)", minval=0, maxval=200, group=groupCD)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Divergencias (Overlay Lux)
+// ─────────────────────────────────────────────────────────────────────────────
+groupDiv = "Divergencias (Overlay Lux)"
+divEnable   = input.bool(true, "Activar divergencias overlay", group=groupDiv)
+divLen      = input.int(14, "RSI Length (div)", minval=2, group=groupDiv)
+divPiv      = input.int(10, "Divergence Length (pivot)", minval=2, maxval=50, group=groupDiv)
+
+divUpper    = input.float(70, "Upper (filtro div)", minval=50, maxval=95, group=groupDiv)
+divLower    = input.float(30, "Lower (filtro div)", minval=5,  maxval=50, group=groupDiv)
+divRestrict = input.bool(true, "Filtro: exigir fuera de Upper/Lower", group=groupDiv)
+
+divRegTog   = input.bool(true,  "Regular", inline="d1", group=groupDiv)
+divRegStyle = input.string("___", "", options=["___","- - -",". . ."], inline="d1", group=groupDiv)
+
+divHidTog   = input.bool(true,  "Hidden",  inline="d2", group=groupDiv)
+divHidStyle = input.string(". . .", "", options=["___","- - -",". . ."], inline="d2", group=groupDiv)
+
+divBullCol  = input.color(#089981, "Bull Color", group=groupDiv)
+divBearCol  = input.color(#f23645, "Bear Color", group=groupDiv)
+
+divWidth    = input.int(2, "Line width", minval=1, maxval=5, group=groupDiv)
+divMaxKeep  = input.int(200, "Max líneas a mantener", minval=20, maxval=500, group=groupDiv)
+
+divLabels   = input.bool(false, "Labels (BR/BH)", group=groupDiv)
+
+// Debug
+groupDbg = "DEBUG"
+debug = input.bool(false, "DEBUG: mostrar estados", group=groupDbg)
+
+//====================================================
+// 2) Cálculo Ultimate RSI (Soldado + Padrinos)
+//====================================================
+sold = f_ursi(src, lenSold, metSold)
+sig  = f_ma(sold, sigLen, sigMet)
+
+// Security siempre calculado; luego se anula si no se usa (más estable)
+pad1_raw = request.security(syminfo.tickerid, tfP1, f_ursi(src, lenP1, metP1), barmerge.gaps_off, barmerge.lookahead_off)
+pad2_raw = request.security(syminfo.tickerid, tfP2, f_ursi(src, lenP2, metP2), barmerge.gaps_off, barmerge.lookahead_off)
+
+pad1 = useP1 ? pad1_raw : na
+pad2 = (useP1 and useP2) ? pad2_raw : na
+
+//====================================================
+// 3) Sesgo Padrino + Filtro plano
+//====================================================
+p1Ema   = ta.ema(pad1, slopeLen)
+p1Slope = p1Ema - p1Ema[1]
+p1Flat  = useP1 and not na(p1Slope) and (math.abs(p1Slope) < flatThr)
+
+biasLong  = useP1 ? (biasMode == "Relativo" ? (sold > pad1) : (p1Slope > 0)) : (sold > midLine)
+biasShort = useP1 ? (biasMode == "Relativo" ? (sold < pad1) : (p1Slope < 0)) : (sold < midLine)
+
+stackOKLong  = stack == "Ignore" ? true :
+     stack == "SoldadoAboveBoth" ? (useP2 and sold > pad1 and sold > pad2) :
+     (useP2 and pad1 > pad2)
+
+stackOKShort = stack == "Ignore" ? true :
+     stack == "SoldadoAboveBoth" ? (useP2 and sold < pad1 and sold < pad2) :
+     (useP2 and pad1 < pad2)
+
+flatOK = not blockFlat or not p1Flat
+
+//====================================================
+// 4) Zonas
+//====================================================
+inOB = sold > obValue
+inOS = sold < osValue
+
+//====================================================
+// 5) KISS & CROSS
+//====================================================
+diff  = useP1 ? (sold - pad1) : (sold - midLine)
+delta = sold - sold[1]
+
+touchBand = math.abs(diff) <= touchThr
+
+touchLongEvent  = touchBand and diff[1] > touchThr
+touchShortEvent = touchBand and diff[1] < -touchThr
+
+bsL = ta.barssince(touchLongEvent)
+bsS = ta.barssince(touchShortEvent)
+
+touchedL = not na(bsL) and bsL <= rejBars
+touchedS = not na(bsS) and bsS <= rejBars
+
+moveAwayUp = diff >= rejMove
+moveAwayDn = (-diff) >= rejMove
+
+kissLong  = useP1 and touchedL and moveAwayUp and delta > 0 and biasLong
+kissShort = useP1 and touchedS and moveAwayDn and delta < 0 and biasShort
+
+crossLong  = useP1 and ta.crossover(sold, pad1)  and delta >= impulse and biasLong
+crossShort = useP1 and ta.crossunder(sold, pad1) and delta <= -impulse and biasShort
+
+//====================================================
+// 6) Filtro signal (timing extra)
+//====================================================
+sigLongOK  = not useSignalFilter or (sold > sig)
+sigShortOK = not useSignalFilter or (sold < sig)
+
+//====================================================
+// 7) Señales finales + Cooldown
+//====================================================
+rawLong  = (kissLong or crossLong)     and biasLong  and flatOK and sigLongOK  and stackOKLong  and (not requireExtreme or inOS)
+rawShort = (kissShort or crossShort)  and biasShort and flatOK and sigShortOK and stackOKShort and (not requireExtreme or inOB)
+
+var int lastSigBar = na
+canFire = na(lastSigBar) or (bar_index - lastSigBar > cooldownBars)
+
+sigLong  = rawLong  and canFire
+sigShort = rawShort and canFire
+
+if sigLong or sigShort
+    lastSigBar := bar_index
+
+//====================================================
+// 8) Plots (panel indicador)
+//====================================================
+midOkColor = autoColor ? chart.fg_color : color.silver
+soldColor  = sold > obValue ? color.new(color.lime, 0) :
+             sold < osValue ? color.new(color.red,  0) :
+             midOkColor
+
+plot(sold, "Soldado (Ultimate RSI)", color=soldColor, linewidth=2)
+plot(showSig ? sig : na, "Signal (Soldado)", color=color.new(color.orange, 0), linewidth=2)
+
+plot(useP1 ? pad1 : na, "Padrino 1 (MTF)", color=color.new(color.orange, 0), linewidth=3, style=plot.style_linebr)
+plot(useP1 and useP2 ? pad2 : na, "Padrino 2 (MTF)", color=color.new(color.yellow, 0), linewidth=2, style=plot.style_linebr)
+
+hline(obValue, "OB", color=color.new(color.lime, 40))
+hline(midLine, "Mid", color=color.new(color.gray,  60))
+hline(osValue, "OS", color=color.new(color.red,  40))
+
+bgcolor(showBands and sold > obValue ? color.new(color.lime, 88) : na)
+bgcolor(showBands and sold < osValue ? color.new(color.red,  88) : na)
+
+//====================================================
+// 9) Señales visuales (KISS/CROSS) - texto SOLO const en Debug
+//====================================================
+isDbg = (mode == "Debug")
+
+// BUY
+plotshape(sigLong and kissLong and showKC and isDbg,     title="BUY KISS (Dbg)",  style=shape.circle,     location=location.bottom, size=size.tiny, color=color.lime, text="K", textcolor=color.black)
+plotshape(sigLong and kissLong and showKC and not isDbg, title="BUY KISS",        style=shape.circle,     location=location.bottom, size=size.tiny, color=color.lime)
+
+plotshape(sigLong and crossLong and showKC and isDbg,     title="BUY CROSS (Dbg)", style=shape.triangleup, location=location.bottom, size=size.tiny, color=color.lime, text="C", textcolor=color.black)
+plotshape(sigLong and crossLong and showKC and not isDbg, title="BUY CROSS",       style=shape.triangleup, location=location.bottom, size=size.tiny, color=color.lime)
+
+// SELL
+plotshape(sigShort and kissShort and showKC and isDbg,     title="SELL KISS (Dbg)", style=shape.circle,       location=location.top, size=size.tiny, color=color.red, text="K", textcolor=color.white)
+plotshape(sigShort and kissShort and showKC and not isDbg, title="SELL KISS",       style=shape.circle,       location=location.top, size=size.tiny, color=color.red)
+
+plotshape(sigShort and crossShort and showKC and isDbg,     title="SELL CROSS (Dbg)", style=shape.triangledown, location=location.top, size=size.tiny, color=color.red, text="C", textcolor=color.white)
+plotshape(sigShort and crossShort and showKC and not isDbg, title="SELL CROSS",       style=shape.triangledown, location=location.top, size=size.tiny, color=color.red)
+
+//====================================================
+// 9.5) Divergencias Lux — SOLO en el CHART (force_overlay)
+//====================================================
+
+// Store pivots (Lux method)
+var pb rsi_h_p1 = pb.new(na, na)
+var pb rsi_h_p2 = pb.new(na, na)
+var pb rsi_l_p1 = pb.new(na, na)
+var pb rsi_l_p2 = pb.new(na, na)
+
+var pb c_h_p1 = pb.new(na, na)
+var pb c_h_p2 = pb.new(na, na)
+var pb c_l_p1 = pb.new(na, na)
+var pb c_l_p2 = pb.new(na, na)
+
+// Line keeper (para no exceder max_lines_count)
+var line[] divLines = array.new_line()
+
+f_pushLine(line ln) =>
+    array.push(divLines, ln)
+    while array.size(divLines) > divMaxKeep
+        line old = array.shift(divLines)
+        if not na(old)
+            line.delete(old)
+
+// Cálculo RSI “candlestick scaled” como Lux (RSI estándar)
+rsiDiv = ta.rsi(close, divLen)
+
+rsi_hst = ta.highest(rsiDiv, divLen)
+rsi_lst = ta.lowest(rsiDiv, divLen)
+
+src_hst = ta.highest(close, divLen)
+src_lst = ta.lowest(close, divLen)
+
+rsi_rng = rsi_hst - rsi_lst
+src_rng = src_hst - src_lst
+
+// Evitar /0
+dif = (rsi_rng == 0.0 or src_rng == 0.0) ? na : (src_rng / rsi_rng)
+
+rsi_mid = math.avg(divUpper, divLower)
+
+chart_upper = na(dif) ? na : close + ((divUpper - rsiDiv) * dif)
+chart_lower = na(dif) ? na : close + ((divLower - rsiDiv) * dif)
+chart_mid   = math.avg(chart_upper, chart_lower)
+
+h_rsi = na(dif) ? rsiDiv : keep_in_range(rsi_mid + ((high  - chart_mid) / dif), 100, 0)
+l_rsi = na(dif) ? rsiDiv : keep_in_range(rsi_mid + ((low   - chart_mid) / dif), 100, 0)
+
+// pivots en high/low RSI escalado
+rsi_piv_h = ta.pivothigh(h_rsi, divPiv, divPiv)
+rsi_piv_l = ta.pivotlow(l_rsi,  divPiv, divPiv)
+
+// actualizar pivots almacenados
+if divEnable and not na(rsi_piv_h)
+    rsi_h_p1 := rsi_h_p2
+    rsi_h_p2 := pb.new(rsi_piv_h, bar_index - divPiv)
+    c_h_p1   := c_h_p2
+    c_h_p2   := pb.new(high[divPiv], bar_index - divPiv)
+
+if divEnable and not na(rsi_piv_l)
+    rsi_l_p1 := rsi_l_p2
+    rsi_l_p2 := pb.new(rsi_piv_l, bar_index - divPiv)
+    c_l_p1   := c_l_p2
+    c_l_p2   := pb.new(low[divPiv], bar_index - divPiv)
+
+// condiciones divergencia (Lux)
+rsi_h_up   = rsi_h_p1.price < rsi_h_p2.price
+rsi_h_down = rsi_h_p1.price > rsi_h_p2.price
+
+rsi_l_up   = rsi_l_p1.price < rsi_l_p2.price
+rsi_l_down = rsi_l_p1.price > rsi_l_p2.price
+
+c_h_up     = c_h_p1.price < c_h_p2.price
+c_h_down   = c_h_p1.price > c_h_p2.price
+
+c_l_up     = c_l_p1.price < c_l_p2.price
+c_l_down   = c_l_p1.price > c_l_p2.price
+
+// Regular
+r_bull = c_l_down and rsi_l_up   and (divRestrict ? rsi_l_p1.price < divLower : true)  // Bullish regular
+r_bear = c_h_up   and rsi_h_down and (divRestrict ? rsi_h_p1.price > divUpper : true)  // Bearish regular
+
+// Hidden
+h_bull = c_l_up   and rsi_l_down and (divRestrict ? rsi_l_p2.price < divLower : true)  // Bullish hidden
+h_bear = c_h_down and rsi_h_up   and (divRestrict ? rsi_h_p2.price > divUpper : true)  // Bearish hidden
+
+// Dibujar SOLO en el chart
+if divEnable
+    // Bearish regular (pivot high confirmado)
+    if not na(rsi_piv_h) and r_bear and divRegTog
+        line ln = line.new(c_h_p1.bar, c_h_p1.price, c_h_p2.bar, c_h_p2.price,
+             color=divBearCol, style=linestyle(divRegStyle), width=divWidth, force_overlay=true)
+        f_pushLine(ln)
+        if divLabels
+            label.new(c_h_p2.bar, c_h_p2.price, "BR", style=label.style_label_down,
+                 textcolor=color.white, color=divBearCol, size=size.tiny, force_overlay=true)
+
+    // Bearish hidden (se dispara con pivote L en RSI low como Lux)
+    if not na(rsi_piv_l) and h_bear and divHidTog
+        line ln = line.new(c_h_p1.bar, c_h_p1.price, c_h_p2.bar, c_h_p2.price,
+             color=divBearCol, style=linestyle(divHidStyle), width=divWidth, force_overlay=true)
+        f_pushLine(ln)
+        if divLabels
+            label.new(c_h_p2.bar, c_h_p2.price, "BH", style=label.style_label_down,
+                 textcolor=color.white, color=divBearCol, size=size.tiny, force_overlay=true)
+
+    // Bullish regular (pivot low confirmado)
+    if not na(rsi_piv_l) and r_bull and divRegTog
+        line ln = line.new(c_l_p1.bar, c_l_p1.price, c_l_p2.bar, c_l_p2.price,
+             color=divBullCol, style=linestyle(divRegStyle), width=divWidth, force_overlay=true)
+        f_pushLine(ln)
+        if divLabels
+            label.new(c_l_p2.bar, c_l_p2.price, "BR", style=label.style_label_up,
+                 textcolor=color.black, color=divBullCol, size=size.tiny, force_overlay=true)
+
+    // Bullish hidden (se dispara con pivote H en RSI high como Lux)
+    if not na(rsi_piv_h) and h_bull and divHidTog
+        line ln = line.new(c_l_p1.bar, c_l_p1.price, c_l_p2.bar, c_l_p2.price,
+             color=divBullCol, style=linestyle(divHidStyle), width=divWidth, force_overlay=true)
+        f_pushLine(ln)
+        if divLabels
+            label.new(c_l_p2.bar, c_l_p2.price, "BH", style=label.style_label_up,
+                 textcolor=color.black, color=divBullCol, size=size.tiny, force_overlay=true)
+
+//====================================================
+// 10) Debug states
+//====================================================
+plotchar(debug and useP1 and p1Flat, title="DBG P1 Flat", char="F", location=location.top, color=color.yellow)
+plotchar(debug and blockFlat and p1Flat, title="DBG Block Flat", char="X", location=location.top, color=color.orange)
+plotchar(debug and requireExtreme and not (inOS or inOB), title="DBG No Extreme", char="E", location=location.top, color=color.gray)
+plotchar(debug and useSignalFilter and not (sigLongOK or sigShortOK), title="DBG Signal Filter", char="S", location=location.top, color=color.gray)
+
+//====================================================
+// 11) Alertas
+//====================================================
+alertcondition(sigLong,  "P&S BUY (Ultimate)",  "P&S Ultimate: BUY válido")
+alertcondition(sigShort, "P&S SELL (Ultimate)", "P&S Ultimate: SELL válido")
+
+alertcondition(ta.crossover(sold, obValue),  "Regime Up (URSI>OB)", "Ultimate RSI: entra en régimen alcista (cruza OB)")
+alertcondition(ta.crossunder(sold, osValue), "Regime Down (URSI<OS)", "Ultimate RSI: entra en régimen bajista (cruza OS)")
